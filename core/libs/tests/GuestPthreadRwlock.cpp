@@ -23,12 +23,15 @@ int APS5_VABI pthread_rwlock_timedrdlock_nid_postfix(PthreadRwlock* rwlock, cons
 int APS5_VABI pthread_rwlock_timedwrlock_nid_postfix(PthreadRwlock* rwlock, const KernelTimespec* abstime);
 int APS5_VABI scePthreadRwlockInit(PthreadRwlock* rwlock, const PthreadRwlockattr* attr, const char* name);
 int APS5_VABI scePthreadRwlockDestroy(PthreadRwlock* rwlock);
+int APS5_VABI scePthreadRwlockUnlock(PthreadRwlock* rwlock);
 }
 
 using TimedLock = int (APS5_VABI *)(PthreadRwlock*, const KernelTimespec*);
 
 static constexpr int SCE_OK = 0;
+static constexpr int SCE_KERNEL_ERROR_EPERM = 0x80020001;
 static constexpr int SCE_KERNEL_ERROR_EBUSY = 0x80020010;
+static constexpr int GUEST_EPERM = 1;
 static constexpr int GUEST_EDEADLK = 11;
 static constexpr int GUEST_EBUSY = 16;
 static constexpr int GUEST_EINVAL = 22;
@@ -190,6 +193,123 @@ static void CheckFailedLockAttempts() {
     Require(rwlock == nullptr);
 }
 
+static void CheckUnownedUnlock() {
+    PthreadRwlock never = nullptr;
+    Require(pthread_rwlock_unlock_nid_postfix(&never) == GUEST_EPERM);
+    Require(never != nullptr);
+    Require(pthread_rwlock_unlock_nid_postfix(&never) == GUEST_EPERM);
+    Require(pthread_rwlock_rdlock_nid_postfix(&never) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&never) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&never) == GUEST_EPERM);
+    Require(pthread_rwlock_wrlock_nid_postfix(&never) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&never) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&never) == GUEST_EPERM);
+    Require(pthread_rwlock_trywrlock_nid_postfix(&never) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&never) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&never) == GUEST_EPERM);
+    Require(pthread_rwlock_destroy_nid_postfix(&never) == 0);
+    Require(never == nullptr);
+
+    PthreadRwlock owned = nullptr;
+    Holder writer{&owned, true};
+    Start(writer);
+    Require(pthread_rwlock_unlock_nid_postfix(&owned) == GUEST_EPERM);
+    Require(scePthreadRwlockUnlock(&owned) == SCE_KERNEL_ERROR_EPERM);
+    Require(pthread_rwlock_trywrlock_nid_postfix(&owned) == GUEST_EBUSY);
+    Require(pthread_rwlock_tryrdlock_nid_postfix(&owned) == GUEST_EBUSY);
+    ExpectTimeout(pthread_rwlock_timedrdlock_nid_postfix, &owned);
+    Require(pthread_rwlock_unlock_nid_postfix(&owned) == GUEST_EPERM);
+    writer.release.store(true);
+    Require(scePthreadJoin(writer.thread, nullptr) == SCE_OK);
+    Require(pthread_rwlock_trywrlock_nid_postfix(&owned) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&owned) == 0);
+    Require(pthread_rwlock_destroy_nid_postfix(&owned) == 0);
+    Require(owned == nullptr);
+
+    PthreadRwlock shared = nullptr;
+    Holder reader{&shared, false};
+    Start(reader);
+    Require(pthread_rwlock_rdlock_nid_postfix(&shared) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&shared) == 0);
+    reader.release.store(true);
+    Require(scePthreadJoin(reader.thread, nullptr) == SCE_OK);
+    Require(pthread_rwlock_unlock_nid_postfix(&shared) == GUEST_EPERM);
+    Require(pthread_rwlock_trywrlock_nid_postfix(&shared) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&shared) == 0);
+    Require(pthread_rwlock_destroy_nid_postfix(&shared) == 0);
+    Require(shared == nullptr);
+}
+
+struct MixedStress {
+    PthreadRwlock rwlock = nullptr;
+    std::atomic<int> unexpected{0};
+    std::atomic<int> refused{0};
+};
+
+static constexpr int STRESS_ROUNDS = 800;
+
+static void* APS5_VABI StressRead(void* arg) {
+    auto& stress = *static_cast<MixedStress*>(arg);
+    for (int round = 0; round < STRESS_ROUNDS; ++round) {
+        int result = 0;
+        if (round % 3 == 0) {
+            result = pthread_rwlock_rdlock_nid_postfix(&stress.rwlock);
+        } else if (round % 3 == 1) {
+            result = pthread_rwlock_tryrdlock_nid_postfix(&stress.rwlock);
+        } else {
+            const KernelTimespec deadline = After(1);
+            result = pthread_rwlock_timedrdlock_nid_postfix(&stress.rwlock, &deadline);
+        }
+        if (result == GUEST_EBUSY || result == GUEST_ETIMEDOUT) continue;
+        if (result != 0) {
+            stress.unexpected.fetch_add(1);
+            continue;
+        }
+        if (pthread_rwlock_unlock_nid_postfix(&stress.rwlock) != 0) stress.refused.fetch_add(1);
+    }
+    return nullptr;
+}
+
+static void* APS5_VABI StressWrite(void* arg) {
+    auto& stress = *static_cast<MixedStress*>(arg);
+    for (int round = 0; round < STRESS_ROUNDS; ++round) {
+        int result = 0;
+        if (round % 3 == 0) {
+            result = pthread_rwlock_wrlock_nid_postfix(&stress.rwlock);
+        } else if (round % 3 == 1) {
+            result = pthread_rwlock_trywrlock_nid_postfix(&stress.rwlock);
+        } else {
+            const KernelTimespec deadline = After(1);
+            result = pthread_rwlock_timedwrlock_nid_postfix(&stress.rwlock, &deadline);
+        }
+        if (result == GUEST_EBUSY || result == GUEST_ETIMEDOUT) continue;
+        if (result != 0) {
+            stress.unexpected.fetch_add(1);
+            continue;
+        }
+        if (pthread_rwlock_unlock_nid_postfix(&stress.rwlock) != 0) stress.refused.fetch_add(1);
+    }
+    return nullptr;
+}
+
+static void CheckMixedStressKeepsCount() {
+    MixedStress stress;
+    Require(scePthreadRwlockInit(&stress.rwlock, nullptr, nullptr) == SCE_OK);
+    Pthread readers[4] = {};
+    Pthread writers[2] = {};
+    for (auto& thread : readers) Require(scePthreadCreate(&thread, nullptr, StressRead, &stress, nullptr) == SCE_OK);
+    for (auto& thread : writers) Require(scePthreadCreate(&thread, nullptr, StressWrite, &stress, nullptr) == SCE_OK);
+    for (auto& thread : readers) Require(scePthreadJoin(thread, nullptr) == SCE_OK);
+    for (auto& thread : writers) Require(scePthreadJoin(thread, nullptr) == SCE_OK);
+    Require(stress.unexpected.load() == 0);
+    Require(stress.refused.load() == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&stress.rwlock) == GUEST_EPERM);
+    Require(pthread_rwlock_trywrlock_nid_postfix(&stress.rwlock) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&stress.rwlock) == 0);
+    Require(pthread_rwlock_destroy_nid_postfix(&stress.rwlock) == 0);
+    Require(stress.rwlock == nullptr);
+}
+
 int main() {
     CheckConcurrentFirstWrlockExcludes();
     const KernelTimespec invalid{0, NANOS_PER_SECOND};
@@ -313,4 +433,6 @@ int main() {
 
     CheckWriterHandoff();
     CheckFailedLockAttempts();
+    CheckUnownedUnlock();
+    CheckMixedStressKeepsCount();
 }
