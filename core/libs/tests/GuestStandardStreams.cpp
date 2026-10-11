@@ -124,6 +124,27 @@ static void CheckRewind() {
 #endif
 }
 
+static void CheckInvalidFgetsSize() {
+    FileStream stream(std::tmpfile());
+    Require(fwrite_nid_postfix("line\n", 1, 5, &stream) == 5);
+    Require(fseeko_nid_postfix(&stream, 0, SEEK_SET) == 0);
+    char buffer[8];
+    for (const int size : {0, -1, INT32_MIN}) {
+        std::memset(buffer, '!', sizeof(buffer));
+        *__error_nid_postfix() = 0;
+        Require(fgets_nid_postfix(buffer, size, &stream) == nullptr);
+        Require(*__error_nid_postfix() == 22);
+        Require(ferror_nid_postfix(&stream) != 0 && (stream.GuestState().flags & 0x40));
+        Require(buffer[0] == '!' && ftello_nid_postfix(&stream) == 0);
+        clearerr_nid_postfix(&stream);
+        Require(ferror_nid_postfix(&stream) == 0 && !(stream.GuestState().flags & 0x40));
+    }
+    std::memset(buffer, '!', sizeof(buffer));
+    Require(fgets_nid_postfix(buffer, sizeof(buffer), &stream) == buffer);
+    Require(std::strcmp(buffer, "line\n") == 0 && ferror_nid_postfix(&stream) == 0);
+    stream.Close();
+}
+
 static bool CheckBinaryModes() {
     const auto directory = "anyps5-byte-stream-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     Require(std::filesystem::create_directory(directory));
@@ -365,5 +386,6 @@ int main() {
     Require(fgetc_nid_postfix(&locked) == 'A' && fgetc_nid_postfix(&locked) == 'B');
     locked.Close();
     CheckRewind();
+    CheckInvalidFgetsSize();
     return CheckBinaryModes() ? 0 : 1;
 }
